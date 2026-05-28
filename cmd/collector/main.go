@@ -4,6 +4,12 @@
 //
 // Usage:
 //   collector -id=node1 -endpoints=localhost:2379 -meters=50 -shards=5 -interval=10s
+//
+// With tumbling window aggregation:
+//   collector -id=node1 -endpoints=localhost:2379 -meters=50 -shards=5 -interval=10s \
+//     -agg-window=30s
+//   collector -id=node1 -endpoints=localhost:2379 -meters=50 -shards=5 -interval=10s \
+//     -agg-count=100
 package main
 
 import (
@@ -16,6 +22,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/yliana-efimova/energy-collector/internal/aggregator"
 	"github.com/yliana-efimova/energy-collector/internal/collector"
 )
 
@@ -26,6 +33,10 @@ func main() {
 		numMeters   = flag.Int("meters", 50, "Number of simulated electricity meters")
 		numShards   = flag.Int("shards", 5, "Number of shards for distribution")
 		interval    = flag.Duration("interval", 10*time.Second, "Collection interval")
+
+		// Tumbling window aggregation flags
+		aggWindow = flag.Duration("agg-window", 0, "Tumbling window duration (e.g. 30s). Enables time-based aggregation.")
+		aggCount  = flag.Int("agg-count", 0, "Tumbling window record count (e.g. 100). Enables count-based aggregation.")
 	)
 	flag.Parse()
 
@@ -41,13 +52,30 @@ func main() {
 	// Parse endpoints
 	ep := parseEndpoints(*endpoints)
 
+	// Build optional aggregator config
+	var aggCfg *aggregator.Config
+	if *aggWindow > 0 {
+		aggCfg = &aggregator.Config{
+			Type:       aggregator.WindowTime,
+			WindowSize: *aggWindow,
+		}
+		log.Printf("Time-based tumbling window enabled: window=%s", *aggWindow)
+	} else if *aggCount > 0 {
+		aggCfg = &aggregator.Config{
+			Type:        aggregator.WindowCount,
+			MaxRecords:  *aggCount,
+		}
+		log.Printf("Count-based tumbling window enabled: max_records=%d", *aggCount)
+	}
+
 	// Create collector config
 	cfg := collector.Config{
-		CollectorID:     *collectorID,
-		EtcdEndpoints:   ep,
-		NumMeters:       *numMeters,
-		NumShards:       *numShards,
-		CollectInterval: *interval,
+		CollectorID:      *collectorID,
+		EtcdEndpoints:    ep,
+		NumMeters:        *numMeters,
+		NumShards:        *numShards,
+		CollectInterval:  *interval,
+		AggregatorConfig: aggCfg,
 	}
 
 	// Create and start collector

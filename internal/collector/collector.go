@@ -10,17 +10,21 @@ import (
 	"sync"
 	"time"
 
+	"github.com/yliana-efimova/energy-collector/internal/aggregator"
 	"github.com/yliana-efimova/energy-collector/internal/coordinator"
 	"github.com/yliana-efimova/energy-collector/internal/source"
 )
 
 // Config holds the collector configuration.
 type Config struct {
-	CollectorID   string
-	EtcdEndpoints []string
-	NumMeters     int
-	NumShards     int
+	CollectorID     string
+	EtcdEndpoints   []string
+	NumMeters       int
+	NumShards       int
 	CollectInterval time.Duration
+
+	// Aggregation config (optional). If nil, raw readings are emitted.
+	AggregatorConfig *aggregator.Config
 }
 
 // Collector represents a data collector instance.
@@ -28,16 +32,31 @@ type Collector struct {
 	cfg         Config
 	coord       *coordinator.Coordinator
 	source      *source.Source
+	agg         *aggregator.Aggregator
 	mu          sync.Mutex
 	collected   int
 }
 
 // New creates a new Collector instance.
 func New(cfg Config) *Collector {
-	return &Collector{
+	c := &Collector{
 		cfg:    cfg,
 		source: source.New(cfg.NumMeters),
 	}
+
+	// Initialize aggregator if configured
+	if cfg.AggregatorConfig != nil {
+		agg, err := aggregator.New(*cfg.AggregatorConfig)
+		if err != nil {
+			log.Printf("[%s] failed to create aggregator, falling back to raw output: %v", cfg.CollectorID, err)
+		} else {
+			c.agg = agg
+			log.Printf("[%s] tumbling window aggregator enabled: type=%s, window_size=%v, max_records=%d",
+				cfg.CollectorID, agg.GetConfig().Type, agg.GetConfig().WindowSize, agg.GetConfig().MaxRecords)
+		}
+	}
+
+	return c
 }
 
 // Start initializes the collector, connects to etcd, and begins collecting data.
@@ -185,14 +204,29 @@ func (c *Collector) collectOnce(ctx context.Context) {
 	c.collected += len(readings)
 	c.mu.Unlock()
 
-	// Output readings as JSON
-	for _, r := range readings {
-		data, _ := json.Marshal(r)
-		log.Printf("[%s] DATA %s", c.cfg.CollectorID, string(data))
+	if c.agg != nil {
+		// Aggregation mode: feed readings into the tumbling window
+		for _, r := range readings {
+			aggregated := c.agg.Add(r)
+			if aggregated != nil {
+				// Window is complete — output aggregated results
+				for _, agg := range aggregated {
+					data, _ := json.Marshal(agg)
+					log.Printf("[%s] AGGREGATED %s", c.cfg.CollectorID, string(data))
+				}
+				log.Printf("[%s] window completed: %d aggregated records (raw: %d, total raw: %d)",
+					c.cfg.CollectorID, len(aggregated), len(readings), c.collected)
+			}
+		}
+	} else {
+		// Raw mode: output each reading as JSON
+		for _, r := range readings {
+			data, _ := json.Marshal(r)
+			log.Printf("[%s] DATA %s", c.cfg.CollectorID, string(data))
+		}
+		log.Printf("[%s] collected %d readings from %d shards (total: %d)",
+			c.cfg.CollectorID, len(readings), len(shards), c.collected)
 	}
-
-	log.Printf("[%s] collected %d readings from %d shards (total: %d)",
-		c.cfg.CollectorID, len(readings), len(shards), c.collected)
 }
 
 // GetStats returns collection statistics.
@@ -207,6 +241,18 @@ func (c *Collector) GetStats() map[string]interface{} {
 
 // Stop gracefully shuts down the collector.
 func (c *Collector) Stop() error {
+	// Flush any remaining aggregated data before shutdown
+	if c.agg != nil {
+		aggregated := c.agg.Flush()
+		if len(aggregated) > 0 {
+			for _, agg := range aggregated {
+				data, _ := json.Marshal(agg)
+				log.Printf("[%s] AGGREGATED (final flush) %s", c.cfg.CollectorID, string(data))
+			}
+			log.Printf("[%s] final flush: %d aggregated records", c.cfg.CollectorID, len(aggregated))
+		}
+	}
+
 	if c.coord != nil {
 		// Resign if leader
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
