@@ -4,7 +4,8 @@
 	docker-build docker-kafka docker-kafka-stop \
 	k8s-apply k8s-delete k8s-hpa k8s-status \
 	run-kafka-collector run-kafka-analyzer run-python-collector run-python-bench \
-	pip-install-all
+	pip-install-all \
+	run-dashboard
 
 BINARY=collector
 BUILD_DIR=build
@@ -197,3 +198,11 @@ run-python-collector: ## Run Python async collector (benchmark mode)
 
 run-python-bench: ## Run Go vs Python benchmark comparison
 	python python/benchmark_compare.py --meters=50 --cycles=10 --output=./benchmark_results
+
+# --- Streamlit Dashboard ---
+
+run-dashboard: ## Run Streamlit energy dashboard (requires: pip install streamlit plotly)
+	streamlit run python/dashboard.py -- --meters=50 --interval=3 --window=300
+
+run-dashboard-light: ## Run Streamlit dashboard in light theme
+	streamlit run python/dashboard.py -- --meters=50 --interval=3 --window=300 --theme=light
