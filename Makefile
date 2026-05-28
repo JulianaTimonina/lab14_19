@@ -1,4 +1,5 @@
-.PHONY: build clean run run-node1 run-node2 run-node3 run-all run-agg-time run-agg-count test lint help
+.PHONY: build clean run run-node1 run-node2 run-node3 run-all run-agg-time run-agg-count run-agg-time-node1 run-agg-time-node2 run-agg-time-node3 run-agg-time-all test lint deps docker-etcd docker-stop \
+	build-arrow run-arrow run-arrow-client run-arrow-bench
 
 BINARY=collector
 BUILD_DIR=build
@@ -58,6 +59,27 @@ run-agg-time-all: ## Run 3 nodes with time-based tumbling window (30s)
 	$(MAKE) run-agg-time-node3 &
 	wait
 
+# --- Apache Arrow Flight RPC targets ---
+
+build-arrow: ## Build the Arrow Flight server binary
+	go build -o $(BUILD_DIR)/arrow-server ./cmd/arrowserver
+
+run-arrow: ## Start the Arrow Flight server (port 50051, 50 meters)
+	go run ./cmd/arrowserver -port=50051 -meters=50 -interval=10s
+
+run-arrow-client: ## Run Python Arrow Flight client
+	python python/arrow_client.py --server localhost:50051
+
+run-arrow-bench: ## Run Python Arrow Flight client with benchmark
+	python python/arrow_client.py --server localhost:50051 --benchmark --iterations=5
+
+# --- Python dependencies ---
+
+pip-install: ## Install Python dependencies for Arrow client
+	pip install -r python/requirements.txt
+
+# --- Testing & Linting ---
+
 test: ## Run tests
 	go test ./... -v
 
@@ -67,6 +89,8 @@ lint: ## Run linter
 deps: ## Download dependencies
 	go mod tidy
 	go mod download
+
+# --- Docker ---
 
 docker-etcd: ## Start etcd in Docker
 	docker run -d --name etcd \

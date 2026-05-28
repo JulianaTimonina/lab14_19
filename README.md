@@ -4,6 +4,8 @@
 
 Поддерживает **оконную агрегацию (tumbling window)** — сырые показания накапливаются на стороне Go и отправляются в лог уже агрегированными (суммы, средние, минимум/максимум), что снижает объём передаваемых данных.
 
+Данные также доступны через **Apache Arrow Flight RPC** — высокопроизводительный протокол передачи колоночных данных. Go-сервер отдаёт показания в формате Arrow RecordBatch, а Python-клиент принимает и анализирует их.
+
 ## Архитектура
 
 ```
@@ -31,6 +33,17 @@
             ┌──────────▼──────────┐
             │  Source (эмулятор)  │
             │  50 счётчиков       │
+            └──────────┬──────────┘
+                       │
+            ┌──────────▼──────────┐
+            │  Arrow Flight Server│
+            │  (gRPC + Arrow)     │
+            │  порт 50051         │
+            └──────────┬──────────┘
+                       │
+            ┌──────────▼──────────┐
+            │  Python Arrow       │
+            │  Flight Client      │
             └─────────────────────┘
 ```
 
@@ -40,12 +53,16 @@
 - **Coordinator** ([`internal/coordinator/coordinator.go`](internal/coordinator/coordinator.go)) — etcd-координация: регистрация инстансов, лидерство, создание и ребалансировка шардов.
 - **Aggregator** ([`internal/aggregator/aggregator.go`](internal/aggregator/aggregator.go)) — оконная агрегация (tumbling window). Поддерживает два режима: временное окно (каждые N секунд) и окон по количеству записей (каждые M записей на счётчик).
 - **Collector** ([`internal/collector/collector.go`](internal/collector/collector.go)) — сборщик данных: получает назначенные шарды из etcd, читает показания с эмулятора, передаёт в агрегатор (если включён) и выводит результат в лог.
-- **Main** ([`cmd/collector/main.go`](cmd/collector/main.go)) — точка входа с CLI-флагами.
+- **Arrow Server** ([`internal/arrowserver/server.go`](internal/arrowserver/server.go)) — Apache Arrow Flight RPC сервер, отдающий показания счётчиков в колоночном формате Arrow.
+- **Arrow Client** ([`python/arrow_client.py`](python/arrow_client.py)) — Python-клиент для получения данных через Arrow Flight RPC с выводом статистики и бенчмаркингом.
+- **Main** ([`cmd/collector/main.go`](cmd/collector/main.go)) — точка входа для etcd-сборщика с CLI-флагами.
+- **Arrow Server Main** ([`cmd/arrowserver/main.go`](cmd/arrowserver/main.go)) — точка входа для Arrow Flight сервера.
 
 ## Требования
 
 - Go 1.21+
 - etcd (локально или в Docker)
+- Python 3.8+ (для Arrow клиента)
 - Make (опционально)
 
 ## Быстрый старт
@@ -98,6 +115,94 @@ go run ./cmd/collector \
   -shards=10 \
   -interval=5s
 ```
+
+## Apache Arrow Flight RPC
+
+Apache Arrow — это кросс-языковой колоночный формат данных, оптимизированный для аналитических нагрузок. Flight RPC — это протокол поверх gRPC для высокопроизводительной передачи Arrow-данных между сервисами.
+
+### Запуск Arrow Flight сервера
+
+```bash
+# Через Make
+make run-arrow
+
+# Или вручную
+go run ./cmd/arrowserver -port=50051 -meters=50 -interval=10s
+```
+
+Сервер запускается на порту 50051 и сразу начинает отдавать данные эмулированных счётчиков через Arrow Flight RPC.
+
+### Установка Python-зависимостей
+
+```bash
+pip install -r python/requirements.txt
+```
+
+### Запуск Python-клиента
+
+```bash
+# Получение данных и вывод статистики
+make run-arrow-client
+
+# Или вручную
+python python/arrow_client.py --server localhost:50051
+```
+
+### Бенчмаркинг производительности
+
+```bash
+# Запуск с бенчмарком (5 итераций)
+make run-arrow-bench
+
+# Или вручную с настройкой итераций
+python python/arrow_client.py --server localhost:50051 --benchmark --iterations=10
+```
+
+### Пример вывода Python-клиента
+
+```
+Connecting to Arrow Flight server at localhost:50051...
+
+============================================================
+📊 ENERGY DATA — Arrow Flight RPC
+============================================================
+  Server:       localhost:50051
+  Rows:         50
+  Columns:      6
+  Column names: ['meter_id', 'location', 'timestamp', 'power_kw', 'voltage_v', 'current_a']
+============================================================
+
+📋 Schema:
+  • meter_id: string
+  • location: string
+  • timestamp: timestamp[us]
+  • power_kw: double
+  • voltage_v: double
+  • current_a: double
+
+📈 Statistics:
+  Power (kW):   min=3.45, max=78.23, avg=40.12
+  Voltage (V):  min=210.15, max=229.87, avg=220.04
+  Current (A):  min=15.02, max=354.67, avg=182.34
+  Unique meters: 50
+
+💾 Memory usage:
+  Arrow table:  2,400 bytes (2.3 KB)
+============================================================
+```
+
+### Сравнение форматов: Arrow vs JSON
+
+| Характеристика | JSON | Apache Arrow |
+|---------------|------|-------------|
+| Формат | Текстовый (строчный) | Бинарный (колоночный) |
+| Размер данных (50 записей) | ~8-10 KB | ~2-3 KB |
+| Скорость сериализации | Медленная ( reflection) | Быстрая (zero-copy) |
+| Скорость десериализации | Медленная (парсинг) | Быстрая (zero-copy) |
+| Типизация | Слабая (строки) | Строгая (схема) |
+| Сжатие | Нет | Встроенное (словари, RLE) |
+| Потоковая передача | Нет (весь файл) | Да (RecordBatch) |
+| Языковая поддержка | Все языки | C++, Go, Python, Java, Rust и др. |
 
 ## Оконная агрегация (Tumbling Window)
 
@@ -157,8 +262,11 @@ make run-agg-time-all
 6. **Агрегация (опционально)**: Если включён агрегатор, показания накапливаются в tumbling window. По заполнении окна (по времени или по количеству записей) формируется агрегированный JSON и выводится в лог.
 7. **Сырой режим (по умолчанию)**: Если агрегатор не включён, каждое показание выводится отдельно как `DATA`.
 8. **Динамика**: При появлении/исчезновении сборщика лидер автоматически перераспределяет шарды.
+9. **Arrow Flight RPC**: Параллельно с etcd-сборкой работает Arrow Flight сервер, который отдаёт показания в колоночном формате через gRPC. Python-клиент может получать эти данные для анализа и бенчмаркинга.
 
 ## Параметры командной строки
+
+### Collector (etcd-сборщик)
 
 | Флаг | По умолчанию | Описание |
 |------|-------------|----------|
@@ -171,6 +279,22 @@ make run-agg-time-all
 | `-agg-count` | `0` | Окно агрегации по количеству записей (например `100`). Включает count-based tumbling window. |
 
 > **Примечание:** Флаги `-agg-window` и `-agg-count` взаимоисключающие. Если указаны оба, приоритет у `-agg-window`.
+
+### Arrow Server
+
+| Флаг | По умолчанию | Описание |
+|------|-------------|----------|
+| `-port` | `50051` | gRPC порт для Arrow Flight RPC |
+| `-meters` | `50` | Количество эмулированных счётчиков |
+| `-interval` | `10s` | Интервал генерации данных |
+
+### Arrow Client (Python)
+
+| Флаг | По умолчанию | Описание |
+|------|-------------|----------|
+| `--server` / `-s` | `localhost:50051` | Адрес Arrow Flight сервера |
+| `--benchmark` / `-b` | `false` | Запустить бенчмарк производительности |
+| `--iterations` / `-n` | `5` | Количество итераций бенчмарка |
 
 ## Пример вывода (сырой режим)
 
@@ -190,8 +314,10 @@ make run-agg-time-all
 
 ```
 ├── cmd/
-│   └── collector/
-│       └── main.go              # Точка входа
+│   ├── collector/
+│   │   └── main.go              # Точка входа etcd-сборщика
+│   └── arrowserver/
+│       └── main.go              # Точка входа Arrow Flight сервера
 ├── internal/
 │   ├── source/
 │   │   └── source.go            # Эмулятор счётчиков
@@ -199,8 +325,13 @@ make run-agg-time-all
 │   │   └── coordinator.go       # etcd-координация
 │   ├── aggregator/
 │   │   └── aggregator.go        # Оконная агрегация (tumbling window)
-│   └── collector/
-│       └── collector.go         # Логика сборщика
+│   ├── collector/
+│   │   └── collector.go         # Логика сборщика
+│   └── arrowserver/
+│       └── server.go            # Apache Arrow Flight RPC сервер
+├── python/
+│   ├── arrow_client.py          # Python-клиент для Arrow Flight
+│   └── requirements.txt         # Python-зависимости
 ├── Makefile                     # Сборочные цели
 ├── go.mod / go.sum              # Go-модуль
 └── README.md                    # Этот файл
@@ -208,9 +339,11 @@ make run-agg-time-all
 
 ## Команды Makefile
 
+### Основные команды
+
 | Команда | Описание |
 |---------|----------|
-| `make build` | Сборка бинарника |
+| `make build` | Сборка бинарника collector |
 | `make build-all` | Кросс-компиляция (linux/darwin/windows) |
 | `make run` | Запуск одного сборщика (сырой режим) |
 | `make run-node1/2/3` | Запуск конкретного узла (сырой режим) |
@@ -219,5 +352,23 @@ make run-agg-time-all
 | `make run-agg-count` | Запуск с count-based окном (100 записей) |
 | `make run-agg-time-node1/2/3` | Запуск узла с time-based окном |
 | `make run-agg-time-all` | Запуск 3 узлов с time-based окном |
+
+### Apache Arrow Flight RPC
+
+| Команда | Описание |
+|---------|----------|
+| `make build-arrow` | Сборка Arrow Flight сервера |
+| `make run-arrow` | Запуск Arrow Flight сервера (порт 50051) |
+| `make run-arrow-client` | Запуск Python-клиента |
+| `make run-arrow-bench` | Запуск Python-клиента с бенчмарком |
+| `make pip-install` | Установка Python-зависимостей |
+
+### Прочие
+
+| Команда | Описание |
+|---------|----------|
 | `make docker-etcd` | Запуск etcd в Docker |
 | `make clean` | Очистка артефактов сборки |
+| `make test` | Запуск тестов |
+| `make lint` | Запуск линтера |
+| `make deps` | Обновление зависимостей |
