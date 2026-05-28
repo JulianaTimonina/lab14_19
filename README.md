@@ -1,548 +1,198 @@
+# Тимонина Юлиана, группа 221131, вариант 19 (повышенная сложность)
 # Energy Collector — Распределённый сборщик данных энергопотребления
 
 Система для распределённого сбора данных с эмулированных счётчиков электроэнергии. Несколько экземпляров Go-сборщика работают параллельно, координируясь через **etcd** для распределения шардов/источников данных.
-
-Поддерживает **оконную агрегацию (tumbling window)** — сырые показания накапливаются на стороне Go и отправляются агрегированными (суммы, средние, минимум/максимум), что снижает объём передаваемых данных.
-
-Данные также доступны через **Apache Arrow Flight RPC** — высокопроизводительный протокол передачи колоночных данных. Go-сервер отдаёт показания в формате Arrow RecordBatch, а Python-клиент принимает и анализирует их.
-
-## Потоковая передача через Kafka
-
-Go-сборщик может отправлять показания в **Kafka**-топик, а Python-анализатор читает их оттуда и выполняет **оконную обработку (скользящее окно 5 минут)** в реальном времени.
-
-## Развёртывание в Kubernetes
-
-Go-сборщик упакован в Docker-образ. Конвейер разворачивается в **minikube/k3s** с **HPA (Horizontal Pod Autoscaler)** на основе загрузки CPU и памяти.
-
-## Сравнение производительности Go vs Python
-
-Реализованы бенчмарки для сравнения скорости сбора, потребления памяти и CPU между Go- и Python-версиями при одинаковой нагрузке. Результаты оформляются в виде отчёта с графиками.
-
-## Архитектура
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                           etcd                                      │
-│            (координация, лидерство, распределение шардов)            │
-└──────┬──────────────┬──────────────┬────────────────────────────────┘
-       │              │              │
-┌──────▼──────┐ ┌─────▼──────┐ ┌────▼──────┐
-│ Collector 1 │ │ Collector 2 │ │ Collector 3│
-│ (node1)     │ │ (node2)     │ │ (node3)    │
-│ Шарды: 1, 3 │ │ Шарды: 2, 5 │ │ Шард: 4    │
-└──────┬──────┘ └──────┬───────┘ └──────┬─────┘
-       │               │                │
-       └───────┬───────┴────────┬───────┘
-               │                │
-        ┌──────▼──────┐  ┌──────▼──────┐
-        │  Aggregator │  │  Aggregator │
-        │ (tumbling   │  │ (tumbling   │
-        │  window)    │  │  window)    │
-        └──────┬──────┘  └──────┬──────┘
-               │                │
-               └───────┬────────┘
-                       │
-            ┌──────────▼──────────┐
-            │  Source (эмулятор)  │
-            │  50 счётчиков       │
-            └──────────┬──────────┘
-                       │
-            ┌──────────▼──────────┐
-            │  Arrow Flight Server│
-            │  (gRPC + Arrow)     │
-            │  порт 50051         │
-            └──────────┬──────────┘
-                       │
-            ┌──────────▼──────────┐
-            │  Python Arrow       │
-            │  Flight Client      │
-            └─────────────────────┘
-
-         ┌──────────────────┐     ┌──────────────────┐
-         │  Go Collector    │────►│     Kafka        │
-         │  (Kafka output)  │     │  energy-readings │
-         └──────────────────┘     └────────┬─────────┘
-                                           │
-                                    ┌──────▼──────────┐
-                                    │ Python Analyzer │
-                                    │ (sliding window │
-                                    │  5 min)         │
-                                    └─────────────────┘
-```
-
-### Компоненты
-
-- **Source** ([`internal/source/source.go`](internal/source/source.go)) — эмулятор счётчиков электроэнергии. Генерирует реалистичные показания: мощность (кВт), напряжение (В), ток (А) с флуктуациями.
-- **Coordinator** ([`internal/coordinator/coordinator.go`](internal/coordinator/coordinator.go)) — etcd-координация: регистрация инстансов, лидерство, создание и ребалансировка шардов.
-- **Aggregator** ([`internal/aggregator/aggregator.go`](internal/aggregator/aggregator.go)) — оконная агрегация (tumbling window). Поддерживает два режима: временное окно (каждые N секунд) и окно по количеству записей (каждые M записей на счётчик).
-- **Collector** ([`internal/collector/collector.go`](internal/collector/collector.go)) — сборщик данных: получает назначенные шарды из etcd, читает показания с эмулятора, передаёт в агрегатор (если включён) и выводит результат в лог или Kafka.
-- **Kafka Producer** ([`internal/kafkautil/kafka.go`](internal/kafkautil/kafka.go)) — отправляет показания счётчиков в Kafka-топик для потоковой обработки.
-- **Arrow Server** ([`internal/arrowserver/server.go`](internal/arrowserver/server.go)) — Apache Arrow Flight RPC сервер, отдающий показания счётчиков в колоночном формате Arrow.
-- **Arrow Client** ([`python/arrow_client.py`](python/arrow_client.py)) — Python-клиент для получения данных через Arrow Flight RPC с выводом статистики и бенчмаркингом.
-- **Async Collector** ([`python/async_collector.py`](python/async_collector.py)) — Python-сборщик данных на asyncio/aiohttp. Эмулирует счётчики и отправляет показания через HTTP или Kafka.
-- **Kafka Analyzer** ([`python/kafka_analyzer.py`](python/kafka_analyzer.py)) — Python-анализатор потоковых данных из Kafka со скользящим окном (5 минут по умолчанию).
-- **Benchmark Compare** ([`python/benchmark_compare.py`](python/benchmark_compare.py)) — скрипт сравнения производительности Go vs Python с построением графиков.
-- **Main** ([`cmd/collector/main.go`](cmd/collector/main.go)) — точка входа для etcd-сборщика с CLI-флагами.
-- **Arrow Server Main** ([`cmd/arrowserver/main.go`](cmd/arrowserver/main.go)) — точка входа для Arrow Flight сервера.
-- **Rust Validator** ([`rust_validator/`](rust_validator/)) — библиотека на Rust для валидации данных энергопотребления. Проверяет формат ID счётчика, диапазоны значений (мощность, напряжение, ток), корректность временных меток и локаций. Интегрирована в Go-сборщик через cgo.
-- **Go Validator Wrapper** ([`internal/validator/validator.go`](internal/validator/validator.go)) — Go-обёртка над Rust-библиотекой валидации через cgo.
-
-## Требования
-
-- Go 1.21+
-- etcd (локально или в Docker)
-- Python 3.8+ (для Arrow клиента, Kafka анализатора, бенчмарков)
-- Kafka 3.x (для потоковой передачи данных)
-- Rust toolchain (cargo, rustc) — только для сборки с валидацией
-- Make (опционально)
-- Docker (для сборки образа и Kubernetes)
-- kubectl + minikube/k3s (для развёртывания в Kubernetes)
-- GCC (MinGW на Windows) — для cgo при сборке с валидацией
-
-## Быстрый старт
-
-### 1. Запуск etcd
-
-**Через Docker:**
-```bash
-make docker-etcd
-```
-
-**Или вручную** (если etcd установлен локально):
-```bash
-etcd
-```
-
-### 2. Запуск Kafka (опционально, для потоковой передачи)
-
-```bash
-make docker-kafka
-```
-
-### 3. Сборка
-
-**Без валидации (обычная сборка):**
-```bash
-make build
-```
-
-**С Rust-валидацией данных:**
-```bash
-make build-with-rust
-```
-
-> **Примечание:** Для сборки с Rust-валидацией требуется установленный Rust toolchain и GCC (MinGW на Windows). На Windows также требуется скопировать `rust_validator.dll` в директорию с исполняемым файлом или в `C:\rust_lib\`.
-
-### 4. Запуск нескольких сборщиков
-
-В разных терминалах:
-
-```bash
-# Терминал 1
-make run-node1
-
-# Терминал 2
-make run-node2
-
-# Терминал 3
-make run-node3
-```
-
-Или одной командой:
-```bash
-make run-all
-```
-
-### 5. Ручной запуск с параметрами
-
-```bash
-go run ./cmd/collector \
-  -id=custom-node \
-  -endpoints=localhost:2379 \
-  -meters=100 \
-  -shards=10 \
-  -interval=5s
-```
-
-## Потоковая передача через Kafka
-
-### Запуск Go-сборщика с Kafka-выводом
-
-```bash
-# Требуется: etcd + Kafka
-make run-kafka-collector
-```
-
-Или вручную:
-```bash
-go run ./cmd/collector \
-  -id=kafka-node1 \
-  -endpoints=localhost:2379 \
-  -meters=50 \
-  -shards=5 \
-  -interval=10s \
-  -kafka \
-  -kafka-brokers=localhost:9092 \
-  -kafka-topic=energy-readings
-```
-
-### Запуск Python-анализатора Kafka
-
-```bash
-make run-kafka-analyzer
-```
-
-Или вручную:
-```bash
-python python/kafka_analyzer.py \
-  --broker=localhost:9092 \
-  --topic=energy-readings \
-  --window=300
-```
-
-Анализатор читает показания из Kafka-топика и выводит агрегированную статистику за скользящее окно (по умолчанию 5 минут) каждые 30 секунд.
-
-## Apache Arrow Flight RPC
-
-Apache Arrow — это кросс-языковой колоночный формат данных, оптимизированный для аналитических нагрузок. Flight RPC — это протокол поверх gRPC для высокопроизводительной передачи Arrow-данных между сервисами.
-
-### Запуск Arrow Flight сервера
-
-```bash
-# Через Make
-make run-arrow
-
-# Или вручную
-go run ./cmd/arrowserver -port=50051 -meters=50 -interval=10s
-```
-
-Сервер запускается на порту 50051 и сразу начинает отдавать данные эмулированных счётчиков через Arrow Flight RPC.
-
-### Установка Python-зависимостей
-
-```bash
-pip install -r python/requirements.txt
-```
-
-### Запуск Python-клиента
-
-```bash
-# Получение данных и вывод статистики
-make run-arrow-client
-
-# Или вручную
-python python/arrow_client.py --server localhost:50051
-```
-
-### Бенчмаркинг производительности
-
-```bash
-# Запуск с бенчмарком (5 итераций)
-make run-arrow-bench
-
-# Или вручную с настройкой итераций
-python python/arrow_client.py --server localhost:50051 --benchmark --iterations=10
-```
-
-### Пример вывода Python-клиента
-
-```
-Connecting to Arrow Flight server at localhost:50051...
-
-============================================================
-📊 ENERGY DATA — Arrow Flight RPC
-============================================================
-  Server:       localhost:50051
-  Rows:         50
-  Columns:      6
-  Column names: ['meter_id', 'location', 'timestamp', 'power_kw', 'voltage_v', 'current_a']
-============================================================
-
-📋 Schema:
-  • meter_id: string
-  • location: string
-  • timestamp: timestamp[us]
-  • power_kw: double
-  • voltage_v: double
-  • current_a: double
-
-📈 Statistics:
-  Power (kW):   min=3.45, max=78.23, avg=40.12
-  Voltage (V):  min=210.15, max=229.87, avg=220.04
-  Current (A):  min=15.02, max=354.67, avg=182.34
-  Unique meters: 50
-
-💾 Memory usage:
-  Arrow table:  2,400 bytes (2.3 KB)
-```
-
-## Сравнение производительности Go vs Python
-
-### Запуск бенчмарка
-
-```bash
-# Установка зависимостей
-pip install -r python/requirements.txt
-
-# Запуск сравнения (50 счётчиков, 10 циклов)
-make run-python-bench
-
-# Или вручную с настройкой параметров
-python python/benchmark_compare.py --meters=50 --cycles=10 --output=./benchmark_results
-
-# Только Python-бенчмарк
-python python/benchmark_compare.py --skip-go --meters=100 --cycles=20
-
-# Только Go-бенчмарк
-python python/benchmark_compare.py --skip-python --meters=100 --cycles=20
-```
-
-### Результаты
-
-Бенчмарк измеряет:
-- **Среднее время цикла** (ms) — время генерации показаний всех счётчиков
-- **Пропускная способность** (readings/sec) — количество показаний в секунду
-- **Потребление памяти** (MB) — прирост памяти во время работы
-- **Загрузка CPU** (%) — средняя загрузка процессора
-
-Результаты сохраняются в JSON и в виде графиков (PNG) в директорию `./benchmark_results/`.
-
-### Пример графика
-
-После запуска бенчмарка графики сохраняются в `./benchmark_results/benchmark_comparison.png`:
-
-![Benchmark Comparison](benchmark_results/benchmark_comparison.png)
-
-## Python-сборщик данных
-
-### Запуск в режиме бенчмарка (без отправки)
-
-```bash
-make run-python-collector
-```
-
-### Запуск с отправкой через HTTP
-
-```bash
-python python/async_collector.py \
-  --meters=50 \
-  --interval=5 \
-  --http-url=http://localhost:8080/api/readings
-```
-
-### Запуск с отправкой в Kafka
-
-```bash
-python python/async_collector.py \
-  --meters=50 \
-  --interval=5 \
-  --kafka-broker=localhost:9092 \
-  --kafka-topic=energy-readings
-```
-
-## Streamlit-дашборд энергопотребления
-
-Веб-дашборд на **Streamlit** для визуализации энергопотребления в реальном времени. Эмулирует счётчики электроэнергии, отображает агрегированную статистику и графики с автообновлением.
-
-### Архитектура дашборда
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    Streamlit Dashboard                       │
-│                                                             │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │              MeterSource (эмулятор)                   │   │
-│  │  50 счётчиков × 8 локаций: мощность, напряжение, ток │   │
-│  └──────────────────────┬───────────────────────────────┘   │
-│                         │                                    │
-│  ┌──────────────────────▼───────────────────────────────┐   │
-│  │              SlidingWindow (скользящее окно)          │   │
-│  │              Хранит показания за последние N секунд   │   │
-│  └──────────────────────┬───────────────────────────────┘   │
-│                         │                                    │
-│  ┌──────────────────────▼───────────────────────────────┐   │
-│  │              Компоненты отображения                   │   │
-│  │                                                      │   │
-│  │  ┌─────────────┐  ┌──────────────┐  ┌─────────────┐  │   │
-│  │  │   KPI Row   │  │  Power Dist. │  │  Power by   │  │   │
-│  │  │ (5 метрик)  │  │ (гистограмма)│  │  Location   │  │   │
-│  │  └─────────────┘  └──────────────┘  └──────┬──────┘  │   │
-│  │                                             │         │   │
-│  │  ┌─────────────┐  ┌──────────────┐  ┌──────▼──────┐  │   │
-│  │  │ Time Series │  │ Top 10      │  │ Meter Table │  │   │
-│  │  │ (3 графика) │  │ Consumers   │  │ (детально)  │  │   │
-│  │  └─────────────┘  └──────────────┘  └─────────────┘  │   │
-│  └──────────────────────────────────────────────────────┘   │
-│                                                             │
-│  ┌──────────────────────────────────────────────────────┐   │
-│  │              Sidebar (настройки)                      │   │
-│  │  Кол-во счётчиков │ Интервал │ Размер окна │ Запуск  │   │
-│  └──────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### Компоненты дашборда
-
-- **MeterSource** ([`python/dashboard.py`](python/dashboard.py)) — эмуляция счётчиков электроэнергии. Генерирует реалистичные показания: мощность (кВт), напряжение (В), ток (А) с флуктуациями для каждого счётчика.
-- **SlidingWindow** ([`python/dashboard.py`](python/dashboard.py)) — скользящее окно, хранящее показания за последние N секунд (по умолчанию 300 с = 5 мин). Автоматически удаляет устаревшие записи.
-- **KPI Row** — строка ключевых показателей: общая мощность (кВт), средняя мощность (кВт), среднее напряжение (В), средний ток (А), количество показаний.
-- **Power Distribution** — гистограмма распределения средней мощности по счётчикам (Plotly).
-- **Power by Location** — столбчатая диаграмма средней мощности по локациям (Plotly).
-- **Time Series** — три временных ряда (мощность, напряжение, ток) с агрегацией по 5-секундным интервалам (Plotly).
-- **Top 10 Consumers** — горизонтальная столбчатая диаграмма топ-10 потребителей по средней мощности (Plotly).
-- **Meter Table** — сворачиваемая детальная таблица по каждому счётчику со всеми показаниями.
-- **Sidebar** — боковая панель с настройками: количество счётчиков (10–200), интервал обновления (1–60 с), размер скользящего окна (10–600 с), кнопка запуска/остановки.
-
-### Запуск дашборда
-
-```bash
-# Установка зависимостей
-pip install -r python/requirements.txt
-
-# Запуск через Make
-make run-dashboard
-
-# Или вручную
-streamlit run python/dashboard.py -- --meters=50 --interval=5 --window=300
-```
-
-Дашборд будет доступен в браузере по адресу `http://localhost:8501`.
-
-### Параметры командной строки
-
-| Флаг | По умолчанию | Описание |
-|------|-------------|----------|
-| `--meters` | `50` | Количество эмулированных счётчиков |
-| `--interval` | `5` | Интервал обновления данных (сек) |
-| `--window` | `300` | Размер скользящего окна (сек) |
-
-### Особенности
-
-- **Автообновление**: страница автоматически перезагружается браузером через заданный интервал с помощью `<meta http-equiv="refresh">`.
-- **Настройки в реальном времени**: изменение параметров в боковой панели применяется после нажатия кнопки «🔄 Запустить».
-- **Интерактивные графики**: все графики построены на Plotly — поддерживают масштабирование, панорамирование и экспорт.
-- **Адаптивная вёрстка**: дашборд корректно отображается на разных разрешениях экрана.
-
-## Развёртывание в Kubernetes
-
-### Сборка Docker-образа
-
-```bash
-make docker-build
-```
-
-### Развёртывание в minikube/k3s
-
-```bash
-# Применить все манифесты
-make k8s-apply
-
-# Проверить статус
-make k8s-status
-
-# Отслеживать HPA
-make k8s-hpa
-```
-
-### Удаление
-
-```bash
-make k8s-delete
-```
-
-### Компоненты Kubernetes
-
-| Ресурс | Описание |
-|--------|----------|
-| [`k8s/namespace.yaml`](k8s/namespace.yaml) | Namespace `energy-system` |
-| [`k8s/etcd-deployment.yaml`](k8s/etcd-deployment.yaml) | etcd для координации сборщиков |
-| [`k8s/kafka-deployment.yaml`](k8s/kafka-deployment.yaml) | Kafka + Zookeeper для потоковой передачи |
-| [`k8s/collector-deployment.yaml`](k8s/collector-deployment.yaml) | Go-сборщик (2 реплики) с Kafka-выводом |
-| [`k8s/arrow-server-deployment.yaml`](k8s/arrow-server-deployment.yaml) | Arrow Flight сервер |
-| [`k8s/hpa.yaml`](k8s/hpa.yaml) | HPA: автоскалирование по CPU (50%) и памяти (70%) |
-
-### HPA (Horizontal Pod Autoscaler)
-
-HPA настроен на:
-- **CPU**: масштабирование при утилизации > 50%
-- **Memory**: масштабирование при утилизации > 70%
-- **Min replicas**: 1
-- **Max replicas**: 10
-- **Stabilization window**: 60s для scale-down, 30s для scale-up
-
-## Оконная агрегация (Tumbling Window)
-
-### Временное окно
-
-```bash
-go run ./cmd/collector -id=node1 -endpoints=localhost:2379 -meters=50 -shards=5 -interval=10s -agg-window=30s
-```
-
-### Окно по количеству записей
-
-```bash
-go run ./cmd/collector -id=node1 -endpoints=localhost:2379 -meters=50 -shards=5 -interval=10s -agg-count=100
-```
-
-## CLI-флаги
-
-### Collector (`cmd/collector/main.go`)
-
-| Флаг | По умолчанию | Описание |
-|------|-------------|----------|
-| `-id` | auto | Уникальный ID инстанса сборщика |
-| `-endpoints` | `localhost:2379` | etcd endpoints (через запятую) |
-| `-meters` | `50` | Количество эмулированных счётчиков |
-| `-shards` | `5` | Количество шардов |
-| `-interval` | `10s` | Интервал сбора данных |
-| `-agg-window` | `0` | Временное окно агрегации (например, `30s`) |
-| `-agg-count` | `0` | Окно агрегации по количеству записей |
-| `-validate` | `false` | Включить Rust-валидацию данных |
-| `-kafka` | `false` | Включить Kafka-вывод |
-| `-kafka-brokers` | `localhost:9092` | Kafka broker адреса (через запятую) |
-| `-kafka-topic` | `energy-readings` | Kafka топик |
-
-### Arrow Server (`cmd/arrowserver/main.go`)
-
-| Флаг | По умолчанию | Описание |
-|------|-------------|----------|
-| `-port` | `50051` | gRPC порт для Arrow Flight RPC |
-| `-meters` | `50` | Количество эмулированных счётчиков |
-| `-interval` | `10s` | Интервал генерации данных |
 
 ## Структура проекта
 
 ```
 .
 ├── cmd/
-│   ├── collector/          # Точка входа Go-сборщика
-│   └── arrowserver/        # Точка входа Arrow Flight сервера
+│   ├── collector/              # Точка входа Go-сборщика
+│   └── arrowserver/            # Точка входа Arrow Flight сервера
 ├── internal/
-│   ├── aggregator/         # Tumbling window агрегация
-│   ├── arrowserver/        # Apache Arrow Flight RPC сервер
-│   ├── collector/          # Логика сбора данных
-│   ├── coordinator/        # etcd-координация
-│   ├── kafkautil/          # Kafka producer/consumer
-│   ├── source/             # Эмуляция счётчиков
-│   └── validator/          # Go-обёртка Rust-валидатора
+│   ├── aggregator/             # Tumbling window агрегация
+│   │   ├── aggregator.go
+│   │   └── aggregator_test.go  # 15 тестов
+│   ├── arrowserver/            # Apache Arrow Flight RPC сервер
+│   ├── collector/              # Логика сбора данных
+│   ├── coordinator/            # etcd-координация
+│   ├── kafkautil/              # Kafka producer/consumer
+│   ├── source/                 # Эмуляция счётчиков
+│   │   ├── source.go
+│   │   └── source_test.go      # 13 тестов
+│   └── validator/              # Go-обёртка Rust-валидатора
 ├── python/
-│   ├── arrow_client.py     # Python Arrow Flight клиент
-│   ├── async_collector.py  # Python asyncio сборщик
-│   ├── kafka_analyzer.py   # Python Kafka анализатор
-│   ├── benchmark_compare.py# Сравнение Go vs Python
-│   ├── dashboard.py        # Streamlit-дашборд энергопотребления
-│   └── requirements.txt    # Python зависимости
-├── .streamlit/
-│   └── config.toml         # Конфигурация Streamlit (headless)
-├── rust_validator/         # Rust библиотека валидации
-├── k8s/                    # Kubernetes манифесты
+│   ├── arrow_client.py         # Python Arrow Flight клиент
+│   ├── async_collector.py      # Python asyncio сборщик
+│   ├── kafka_analyzer.py       # Python Kafka анализатор
+│   ├── benchmark_compare.py    # Сравнение Go vs Python
+│   ├── dashboard.py            # Streamlit-дашборд
+│   └── requirements.txt        # Python зависимости
+├── rust_validator/             # Rust библиотека валидации
+│   └── src/lib.rs              # 19 тестов
+├── k8s/                        # Kubernetes манифесты
 │   ├── namespace.yaml
 │   ├── etcd-deployment.yaml
 │   ├── kafka-deployment.yaml
 │   ├── collector-deployment.yaml
 │   ├── arrow-server-deployment.yaml
 │   └── hpa.yaml
-├── Dockerfile              # Dockerfile для Go-сборщика
-├── Makefile                # Цели сборки и запуска
-├── go.mod
-└── go.sum
+├── .streamlit/
+│   └── config.toml             # Конфигурация Streamlit (headless)
+├── Dockerfile                  # Dockerfile для Go-сборщика
+├── Makefile                    # Цели сборки и запуска
+├── go.mod / go.sum
+├── PROMPT_LOG.md               # Лог промптов для воспроизведения
+└── README.md
+```
+
+## Компоненты
+
+| Компонент | Описание |
+|-----------|----------|
+| [`internal/source/source.go`](internal/source/source.go) | Эмулятор счётчиков электроэнергии. Генерирует показания: мощность (кВт), напряжение (В), ток (А) с флуктуациями. |
+| [`internal/coordinator/coordinator.go`](internal/coordinator/coordinator.go) | etcd-координация: регистрация инстансов, лидерство, ребалансировка шардов. |
+| [`internal/aggregator/aggregator.go`](internal/aggregator/aggregator.go) | Оконная агрегация (tumbling window): time-based (каждые N сек) и count-based (каждые M записей). |
+| [`internal/collector/collector.go`](internal/collector/collector.go) | Сборщик: получает шарды из etcd, читает показания, агрегирует, выводит в лог или Kafka. |
+| [`internal/kafkautil/kafka.go`](internal/kafkautil/kafka.go) | Kafka producer/consumer для потоковой передачи показаний. |
+| [`internal/arrowserver/server.go`](internal/arrowserver/server.go) | Apache Arrow Flight RPC сервер, отдающий данные в колоночном формате. |
+| [`internal/validator/validator.go`](internal/validator/validator.go) | Go-обёртка над Rust-библиотекой валидации через cgo. |
+| [`python/arrow_client.py`](python/arrow_client.py) | Python-клиент для Arrow Flight RPC со статистикой и бенчмаркингом. |
+| [`python/async_collector.py`](python/async_collector.py) | Python-сборщик на asyncio/aiohttp с HTTP и Kafka-выводом. |
+| [`python/kafka_analyzer.py`](python/kafka_analyzer.py) | Python-анализатор Kafka со скользящим окном (5 мин). |
+| [`python/benchmark_compare.py`](python/benchmark_compare.py) | Сравнение Go vs Python: время, память, CPU, графики. |
+| [`python/dashboard.py`](python/dashboard.py) | Streamlit-дашборд с Plotly-графиками и автообновлением. |
+| [`rust_validator/src/lib.rs`](rust_validator/src/lib.rs) | Rust-библиотека валидации с C-compatible API. Проверяет ID, мощность, напряжение, ток, timestamp, локацию. |
+
+## Требования
+
+- Go 1.21+, etcd, Python 3.8+, Kafka 3.x (опционально)
+- Rust toolchain + GCC (MinGW на Windows) — только для сборки с валидацией
+- Docker, kubectl + minikube/k3s (для K8s)
+
+## Быстрый старт
+
+```bash
+# 1. Запуск etcd
+make docker-etcd
+
+# 2. Сборка
+make build                    # без валидации
+make build-with-rust          # с Rust-валидацией
+
+# 3. Запуск сборщиков (3 терминала или одной командой)
+make run-node1   # терминал 1
+make run-node2   # терминал 2
+make run-node3   # терминал 3
+# или
+make run-all
+```
+
+### Ручной запуск
+
+```bash
+go run ./cmd/collector -id=node1 -endpoints=localhost:2379 -meters=100 -shards=10 -interval=5s
+```
+
+## Потоковая передача через Kafka
+
+```bash
+# Go-сборщик → Kafka
+make run-kafka-collector
+
+# Python-анализатор ← Kafka
+make run-kafka-analyzer
+```
+
+Анализатор читает показания из Kafka-топика и выводит агрегированную статистику за скользящее окно (5 мин) каждые 30 секунд.
+
+## Apache Arrow Flight RPC
+
+```bash
+# Сервер
+make run-arrow
+
+# Python-клиент
+make run-arrow-client
+
+# Бенчмарк (5 итераций)
+make run-arrow-bench
+```
+
+## Streamlit-дашборд
+
+```bash
+make run-dashboard
+# или: streamlit run python/dashboard.py -- --meters=50 --interval=5 --window=300
+```
+
+Дашборд доступен по адресу `http://localhost:8501`. Автообновление через `<meta http-equiv="refresh">`.
+
+Параметры: `--meters` (10–200), `--interval` (1–60 с), `--window` (10–600 с).
+
+## Сравнение Go vs Python
+
+```bash
+make run-python-bench
+# или: python python/benchmark_compare.py --meters=50 --cycles=10 --output=./benchmark_results
+```
+
+Измеряет: среднее время цикла, пропускную способность, память, CPU. Результаты в JSON и PNG.
+
+## Оконная агрегация
+
+```bash
+# Time-based (каждые 30 с)
+go run ./cmd/collector -id=node1 -endpoints=localhost:2379 -meters=50 -shards=5 -interval=10s -agg-window=30s
+
+# Count-based (каждые 100 записей)
+go run ./cmd/collector -id=node1 -endpoints=localhost:2379 -meters=50 -shards=5 -interval=10s -agg-count=100
+```
+
+## Развёртывание в Kubernetes
+
+```bash
+make docker-build     # сборка образа
+make k8s-apply        # развёртывание
+make k8s-status       # проверка
+make k8s-hpa          # мониторинг HPA
+make k8s-delete       # удаление
+```
+
+### Компоненты K8s
+
+| Ресурс | Описание |
+|--------|----------|
+| [`k8s/namespace.yaml`](k8s/namespace.yaml) | Namespace `energy-system` |
+| [`k8s/etcd-deployment.yaml`](k8s/etcd-deployment.yaml) | etcd для координации |
+| [`k8s/kafka-deployment.yaml`](k8s/kafka-deployment.yaml) | Kafka + Zookeeper |
+| [`k8s/collector-deployment.yaml`](k8s/collector-deployment.yaml) | Go-сборщик (2 реплики) |
+| [`k8s/arrow-server-deployment.yaml`](k8s/arrow-server-deployment.yaml) | Arrow Flight сервер |
+| [`k8s/hpa.yaml`](k8s/hpa.yaml) | HPA: CPU 50%, Memory 70%, 1–10 реплик |
+
+## CLI-флаги
+
+### Collector
+
+| Флаг | По умолчанию | Описание |
+|------|-------------|----------|
+| `-id` | auto | ID инстанса |
+| `-endpoints` | `localhost:2379` | etcd endpoints |
+| `-meters` | `50` | Количество счётчиков |
+| `-shards` | `5` | Количество шардов |
+| `-interval` | `10s` | Интервал сбора |
+| `-agg-window` | `0` | Временное окно агрегации |
+| `-agg-count` | `0` | Окно по количеству записей |
+| `-validate` | `false` | Rust-валидация |
+| `-kafka` | `false` | Kafka-вывод |
+| `-kafka-brokers` | `localhost:9092` | Kafka brokers |
+| `-kafka-topic` | `energy-readings` | Kafka топик |
+
+### Arrow Server
+
+| Флаг | По умолчанию | Описание |
+|------|-------------|----------|
+| `-port` | `50051` | gRPC порт |
+| `-meters` | `50` | Количество счётчиков |
+| `-interval` | `10s` | Интервал генерации |
