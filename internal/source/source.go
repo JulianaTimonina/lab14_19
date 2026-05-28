@@ -7,6 +7,8 @@ import (
 	"math/rand"
 	"sync"
 	"time"
+
+	"github.com/yliana-efimova/energy-collector/internal/validator"
 )
 
 // Meter represents a single electricity meter.
@@ -25,6 +27,20 @@ type Reading struct {
 	PowerKW    float64   `json:"power_kw"`
 	VoltageV   float64   `json:"voltage_v"`
 	CurrentA   float64   `json:"current_a"`
+}
+
+// Validate checks the reading against Rust validation library.
+// Returns nil if valid, or a slice of error messages.
+func (r *Reading) Validate() []string {
+	_, errs := validator.ValidateReading(validator.ReadingInput{
+		MeterID:   r.MeterID,
+		Location:  r.Location,
+		Timestamp: r.Timestamp.UnixMicro(),
+		PowerKW:   r.PowerKW,
+		VoltageV:  r.VoltageV,
+		CurrentA:  r.CurrentA,
+	})
+	return errs
 }
 
 // Source manages a collection of simulated meters.

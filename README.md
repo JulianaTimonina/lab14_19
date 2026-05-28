@@ -57,13 +57,17 @@
 - **Arrow Client** ([`python/arrow_client.py`](python/arrow_client.py)) — Python-клиент для получения данных через Arrow Flight RPC с выводом статистики и бенчмаркингом.
 - **Main** ([`cmd/collector/main.go`](cmd/collector/main.go)) — точка входа для etcd-сборщика с CLI-флагами.
 - **Arrow Server Main** ([`cmd/arrowserver/main.go`](cmd/arrowserver/main.go)) — точка входа для Arrow Flight сервера.
+- **Rust Validator** ([`rust_validator/`](rust_validator/)) — библиотека на Rust для валидации данных энергопотребления. Проверяет формат ID счётчика, диапазоны значений (мощность, напряжение, ток), корректность временных меток и локаций. Интегрирована в Go-сборщик через cgo.
+- **Go Validator Wrapper** ([`internal/validator/validator.go`](internal/validator/validator.go)) — Go-обёртка над Rust-библиотекой валидации через cgo.
 
 ## Требования
 
 - Go 1.21+
 - etcd (локально или в Docker)
 - Python 3.8+ (для Arrow клиента)
+- Rust toolchain (cargo, rustc) — только для сборки с валидацией
 - Make (опционально)
+- GCC (MinGW на Windows) — для cgo при сборке с валидацией
 
 ## Быстрый старт
 
@@ -81,9 +85,17 @@ etcd
 
 ### 2. Сборка
 
+**Без валидации (обычная сборка):**
 ```bash
 make build
 ```
+
+**С Rust-валидацией данных:**
+```bash
+make build-with-rust
+```
+
+> **Примечание:** Для сборки с Rust-валидацией требуется установленный Rust toolchain и GCC (MinGW на Windows). На Windows также требуется скопировать `rust_validator.dll` в директорию с исполняемым файлом или в `C:\rust_lib\`.
 
 ### 3. Запуск нескольких сборщиков
 
@@ -264,6 +276,82 @@ make run-agg-time-all
 8. **Динамика**: При появлении/исчезновении сборщика лидер автоматически перераспределяет шарды.
 9. **Arrow Flight RPC**: Параллельно с etcd-сборкой работает Arrow Flight сервер, который отдаёт показания в колоночном формате через gRPC. Python-клиент может получать эти данные для анализа и бенчмаркинга.
 
+## Rust-валидация данных
+
+Библиотека [`rust_validator`](rust_validator/) реализована на Rust и предоставляет функции для валидации данных энергопотребления. Она интегрирована в Go-сборщик через механизм cgo.
+
+### Что проверяется
+
+| Проверка | Описание | Допустимые значения |
+|----------|----------|-------------------|
+| **ID счётчика** | Формат `MTR-XXX`, где XXX — цифры | `MTR-001`, `MTR-999`, макс. 16 символов |
+| **Мощность (кВт)** | Диапазон значений | 0.0 – 150.0 кВт |
+| **Напряжение (В)** | Диапазон значений | 100.0 – 300.0 В |
+| **Ток (А)** | Диапазон значений | 0.0 – 500.0 А |
+| **Временная метка** | Unix timestamp в микросекундах | 2000-01-01 – 2100-01-01 |
+| **Локация** | Должна быть из списка допустимых | "Building A - Floor 1", "Building D - Charging Station" и др. |
+
+### Сборка Rust-библиотеки
+
+```bash
+# Сборка (release)
+make rust-build
+
+# Запуск тестов
+make rust-test
+
+# Очистка
+make rust-clean
+```
+
+### Запуск с валидацией
+
+```bash
+# Через Make (автоматически собирает Rust и Go)
+make run-with-rust
+
+# Или вручную (после сборки Rust)
+go run -ldflags="-r rust_validator/target/release" ./cmd/collector \
+  -id=node1 -endpoints=localhost:2379 -meters=50 -shards=5 -interval=10s -validate
+```
+
+При включённой валидации (`-validate`) каждое показание счётчика проверяется через Rust-библиотеку. В случае обнаружения некорректных данных в лог выводится предупреждение:
+
+```
+2026/05/28 14:15:33.456789 [node1] VALIDATION WARNING: meter=MTR-001 errors=["power_kw -1.234 out of range [0, 150]"]
+```
+
+Валидация не блокирует обработку данных — некорректные показания логируются как предупреждения, но не отбрасываются.
+
+### Структура Rust-библиотеки
+
+```
+rust_validator/
+├── Cargo.toml          # Манифест Rust-проекта
+├── src/
+│   └── lib.rs          # Основной код: функции валидации и C-compatible API
+└── target/
+    └── release/
+        ├── rust_validator.dll      # Динамическая библиотека (Windows)
+        ├── rust_validator.dll.lib  # Библиотека импорта (Windows)
+        └── rust_validator.lib      # Статическая библиотека (Windows)
+```
+
+### C-compatible API
+
+Библиотека экспортирует следующие C-функции для вызова из Go:
+
+| Функция | Описание |
+|---------|----------|
+| `rust_validator_check_meter_id` | Проверка ID счётчика |
+| `rust_validator_check_power` | Проверка мощности |
+| `rust_validator_check_voltage` | Проверка напряжения |
+| `rust_validator_check_current` | Проверка тока |
+| `rust_validator_check_location` | Проверка локации |
+| `rust_validator_check_timestamp` | Проверка временной метки |
+| `rust_validator_check_reading` | Проверка полного показания (JSON) |
+| `rust_validator_free_result` | Освобождение памяти результата |
+
 ## Параметры командной строки
 
 ### Collector (etcd-сборщик)
@@ -277,6 +365,7 @@ make run-agg-time-all
 | `-interval` | `10s` | Интервал сбора данных |
 | `-agg-window` | `0` | Временное окно агрегации (например `30s`). Включает time-based tumbling window. |
 | `-agg-count` | `0` | Окно агрегации по количеству записей (например `100`). Включает count-based tumbling window. |
+| `-validate` | `false` | Включить Rust-валидацию данных (требует сборки с Rust-библиотекой) |
 
 > **Примечание:** Флаги `-agg-window` и `-agg-count` взаимоисключающие. Если указаны оба, приоритет у `-agg-window`.
 
@@ -320,15 +409,21 @@ make run-agg-time-all
 │       └── main.go              # Точка входа Arrow Flight сервера
 ├── internal/
 │   ├── source/
-│   │   └── source.go            # Эмулятор счётчиков
+│   │   └── source.go            # Эмулятор счётчиков (с методом Validate())
 │   ├── coordinator/
 │   │   └── coordinator.go       # etcd-координация
 │   ├── aggregator/
 │   │   └── aggregator.go        # Оконная агрегация (tumbling window)
 │   ├── collector/
-│   │   └── collector.go         # Логика сборщика
+│   │   └── collector.go         # Логика сборщика (с поддержкой валидации)
+│   ├── validator/
+│   │   └── validator.go         # Go-обёртка над Rust-библиотекой (cgo)
 │   └── arrowserver/
 │       └── server.go            # Apache Arrow Flight RPC сервер
+├── rust_validator/
+│   ├── Cargo.toml               # Манифест Rust-проекта
+│   └── src/
+│       └── lib.rs               # Rust-библиотека валидации
 ├── python/
 │   ├── arrow_client.py          # Python-клиент для Arrow Flight
 │   └── requirements.txt         # Python-зависимости
@@ -352,6 +447,17 @@ make run-agg-time-all
 | `make run-agg-count` | Запуск с count-based окном (100 записей) |
 | `make run-agg-time-node1/2/3` | Запуск узла с time-based окном |
 | `make run-agg-time-all` | Запуск 3 узлов с time-based окном |
+
+### Rust-валидация
+
+| Команда | Описание |
+|---------|----------|
+| `make rust-build` | Сборка Rust-библиотеки валидации |
+| `make rust-test` | Запуск тестов Rust-библиотеки |
+| `make rust-clean` | Очистка артефактов Rust |
+| `make build-with-rust` | Сборка Go-сборщика с Rust-валидацией |
+| `make build-all-with-rust` | Кросс-компиляция с Rust-валидацией |
+| `make run-with-rust` | Запуск сборщика с Rust-валидацией |
 
 ### Apache Arrow Flight RPC
 

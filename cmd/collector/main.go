@@ -37,6 +37,9 @@ func main() {
 		// Tumbling window aggregation flags
 		aggWindow = flag.Duration("agg-window", 0, "Tumbling window duration (e.g. 30s). Enables time-based aggregation.")
 		aggCount  = flag.Int("agg-count", 0, "Tumbling window record count (e.g. 100). Enables count-based aggregation.")
+
+		// Rust validation flag
+		enableValidation = flag.Bool("validate", false, "Enable Rust-based data validation for readings")
 	)
 	flag.Parse()
 
@@ -76,6 +79,11 @@ func main() {
 		NumShards:        *numShards,
 		CollectInterval:  *interval,
 		AggregatorConfig: aggCfg,
+		EnableValidation: *enableValidation,
+	}
+
+	if *enableValidation {
+		log.Printf("Rust-based data validation enabled")
 	}
 
 	// Create and start collector

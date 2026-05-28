@@ -25,6 +25,11 @@ type Config struct {
 
 	// Aggregation config (optional). If nil, raw readings are emitted.
 	AggregatorConfig *aggregator.Config
+
+	// EnableValidation enables Rust-based data validation for readings.
+	// When enabled, each reading is validated against the Rust validator library.
+	// Invalid readings are logged as warnings but not discarded.
+	EnableValidation bool
 }
 
 // Collector represents a data collector instance.
@@ -199,6 +204,16 @@ func (c *Collector) collectOnce(ctx context.Context) {
 
 	// Read data from the source
 	readings := c.source.ReadMeters(meterIDs)
+
+	// Validate readings using Rust validator library (if enabled)
+	if c.cfg.EnableValidation {
+		for _, r := range readings {
+			if errs := r.Validate(); len(errs) > 0 {
+				log.Printf("[%s] VALIDATION WARNING: meter=%s errors=%v",
+					c.cfg.CollectorID, r.MeterID, errs)
+			}
+		}
+	}
 
 	c.mu.Lock()
 	c.collected += len(readings)
