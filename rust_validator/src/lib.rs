@@ -198,48 +198,58 @@ pub struct ReadingInput {
 pub struct ReadingValidation {
     pub is_valid: bool,
     pub errors: Vec<String>,
+    /// Коды ошибок в том же порядке, что и errors.
+    pub codes: Vec<ValidationCode>,
 }
 
 /// Валидирует одно показание счётчика.
 /// Возвращает `ReadingValidation` со списком ошибок (если есть).
 pub fn validate_reading(reading: &ReadingInput) -> ReadingValidation {
     let mut errors: Vec<String> = Vec::new();
+    let mut codes: Vec<ValidationCode> = Vec::new();
 
     // Валидация meter_id
     if let Err(e) = validate_meter_id(&reading.meter_id) {
         errors.push(e);
+        codes.push(ValidationCode::InvalidMeterId);
     }
 
     // Валидация location
     if let Err(e) = validate_location(&reading.location) {
         errors.push(e);
+        codes.push(ValidationCode::InvalidLocation);
     }
 
     // Валидация timestamp
     if let Some(ts) = reading.timestamp {
         if let Err(e) = validate_timestamp_us(ts) {
             errors.push(e);
+            codes.push(ValidationCode::InvalidTimestamp);
         }
     }
 
     // Валидация power_kw
     if let Err(e) = validate_power(reading.power_kw) {
         errors.push(e);
+        codes.push(ValidationCode::PowerOutOfRange);
     }
 
     // Валидация voltage_v
     if let Err(e) = validate_voltage(reading.voltage_v) {
         errors.push(e);
+        codes.push(ValidationCode::VoltageOutOfRange);
     }
 
     // Валидация current_a
     if let Err(e) = validate_current(reading.current_a) {
         errors.push(e);
+        codes.push(ValidationCode::CurrentOutOfRange);
     }
 
     ReadingValidation {
         is_valid: errors.is_empty(),
         errors,
+        codes,
     }
 }
 
@@ -395,7 +405,9 @@ pub unsafe extern "C" fn rust_validator_check_reading(json_str: *const c_char) -
                 make_valid_result()
             } else {
                 let combined = rv.errors.join("; ");
-                make_result(ValidationCode::InvalidMeterId, &combined)
+                // Возвращаем код первой ошибки вместо всегда InvalidMeterId
+                let first_code = rv.codes.first().copied().unwrap_or(ValidationCode::InternalError);
+                make_result(first_code, &combined)
             }
         }
         Err(e) => make_result(ValidationCode::InternalError, &e),
@@ -532,5 +544,104 @@ mod tests {
         }"#;
         let result = validate_reading_json(json).unwrap();
         assert!(!result.is_valid);
+    }
+
+    #[test]
+    fn test_validation_error_codes() {
+        // Проверяем, что каждая ошибка возвращает свой код
+        let reading = ReadingInput {
+            meter_id: "BAD-ID".to_string(),
+            location: "Building A - Floor 1".to_string(),
+            timestamp: Some(1672531200000000),
+            power_kw: 42.5,
+            voltage_v: 220.0,
+            current_a: 193.18,
+        };
+        let result = validate_reading(&reading);
+        assert!(!result.is_valid);
+        assert_eq!(result.codes[0], ValidationCode::InvalidMeterId);
+
+        // Только power вне диапазона
+        let reading2 = ReadingInput {
+            meter_id: "MTR-001".to_string(),
+            location: "Building A - Floor 1".to_string(),
+            timestamp: Some(1672531200000000),
+            power_kw: 999.0,
+            voltage_v: 220.0,
+            current_a: 193.18,
+        };
+        let result2 = validate_reading(&reading2);
+        assert!(!result2.is_valid);
+        assert_eq!(result2.codes[0], ValidationCode::PowerOutOfRange);
+
+        // Только voltage вне диапазона
+        let reading3 = ReadingInput {
+            meter_id: "MTR-001".to_string(),
+            location: "Building A - Floor 1".to_string(),
+            timestamp: Some(1672531200000000),
+            power_kw: 42.5,
+            voltage_v: 0.0,
+            current_a: 193.18,
+        };
+        let result3 = validate_reading(&reading3);
+        assert!(!result3.is_valid);
+        assert_eq!(result3.codes[0], ValidationCode::VoltageOutOfRange);
+
+        // Только current вне диапазона
+        let reading4 = ReadingInput {
+            meter_id: "MTR-001".to_string(),
+            location: "Building A - Floor 1".to_string(),
+            timestamp: Some(1672531200000000),
+            power_kw: 42.5,
+            voltage_v: 220.0,
+            current_a: 999.0,
+        };
+        let result4 = validate_reading(&reading4);
+        assert!(!result4.is_valid);
+        assert_eq!(result4.codes[0], ValidationCode::CurrentOutOfRange);
+
+        // Только location невалидна
+        let reading5 = ReadingInput {
+            meter_id: "MTR-001".to_string(),
+            location: "Unknown Place".to_string(),
+            timestamp: Some(1672531200000000),
+            power_kw: 42.5,
+            voltage_v: 220.0,
+            current_a: 193.18,
+        };
+        let result5 = validate_reading(&reading5);
+        assert!(!result5.is_valid);
+        assert_eq!(result5.codes[0], ValidationCode::InvalidLocation);
+
+        // Только timestamp невалиден
+        let reading6 = ReadingInput {
+            meter_id: "MTR-001".to_string(),
+            location: "Building A - Floor 1".to_string(),
+            timestamp: Some(0),
+            power_kw: 42.5,
+            voltage_v: 220.0,
+            current_a: 193.18,
+        };
+        let result6 = validate_reading(&reading6);
+        assert!(!result6.is_valid);
+        assert_eq!(result6.codes[0], ValidationCode::InvalidTimestamp);
+    }
+
+    #[test]
+    fn test_check_reading_returns_correct_code() {
+        // Проверяем, что C-функция возвращает правильный код для power
+        // Используем validate_reading_json + проверку codes
+        let json = r#"{
+            "meter_id": "MTR-001",
+            "location": "Building A - Floor 1",
+            "timestamp": 1672531200000000,
+            "power_kw": 999.0,
+            "voltage_v": 220.0,
+            "current_a": 193.18
+        }"#;
+        let result = validate_reading_json(json).unwrap();
+        assert!(!result.is_valid);
+        assert_eq!(result.codes[0], ValidationCode::PowerOutOfRange,
+            "power error should return PowerOutOfRange, not InvalidMeterId");
     }
 }
