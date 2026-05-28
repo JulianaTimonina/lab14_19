@@ -588,6 +588,13 @@ def main():
         </style>
         """, unsafe_allow_html=True)
 
+    # Автообновление страницы через meta refresh (вместо st.rerun, который вызывает бесконечный цикл)
+    interval_sec = int(args.interval)
+    st.markdown(
+        f'<meta http-equiv="refresh" content="{interval_sec}">',
+        unsafe_allow_html=True,
+    )
+
     # Инициализация
     init_session_state(args)
 
@@ -629,10 +636,6 @@ def main():
     st.caption(f"🔄 Автообновление каждые {interval}с · "
                f"Данных в окне: {stats.get('total_readings', 0):,} · "
                f"Счётчиков: {stats.get('unique_meters', 0)}")
-
-    # Перезапуск через interval секунд
-    time.sleep(0.1)  # Небольшая задержка для завершения рендеринга
-    st.rerun()
 
 
 if __name__ == "__main__":
