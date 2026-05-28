@@ -10,6 +10,10 @@
 //     -agg-window=30s
 //   collector -id=node1 -endpoints=localhost:2379 -meters=50 -shards=5 -interval=10s \
 //     -agg-count=100
+//
+// With Kafka output:
+//   collector -id=node1 -endpoints=localhost:2379 -meters=50 -shards=5 -interval=10s \
+//     -kafka -kafka-brokers=localhost:9092 -kafka-topic=energy-readings
 package main
 
 import (
@@ -19,6 +23,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -40,6 +45,11 @@ func main() {
 
 		// Rust validation flag
 		enableValidation = flag.Bool("validate", false, "Enable Rust-based data validation for readings")
+
+		// Kafka output flags
+		kafkaMode   = flag.Bool("kafka", false, "Enable Kafka output mode")
+		kafkaBrokers = flag.String("kafka-brokers", "localhost:9092", "Comma-separated Kafka broker addresses")
+		kafkaTopic   = flag.String("kafka-topic", "energy-readings", "Kafka topic name")
 	)
 	flag.Parse()
 
@@ -71,6 +81,18 @@ func main() {
 		log.Printf("Count-based tumbling window enabled: max_records=%d", *aggCount)
 	}
 
+	// Determine output mode
+	outputMode := collector.OutputLog
+	var kafkaBrokersList []string
+	if *kafkaMode {
+		outputMode = collector.OutputKafka
+		kafkaBrokersList = strings.Split(*kafkaBrokers, ",")
+		for i := range kafkaBrokersList {
+			kafkaBrokersList[i] = strings.TrimSpace(kafkaBrokersList[i])
+		}
+		log.Printf("Kafka output mode enabled: brokers=%v, topic=%s", kafkaBrokersList, *kafkaTopic)
+	}
+
 	// Create collector config
 	cfg := collector.Config{
 		CollectorID:      *collectorID,
@@ -80,6 +102,9 @@ func main() {
 		CollectInterval:  *interval,
 		AggregatorConfig: aggCfg,
 		EnableValidation: *enableValidation,
+		OutputMode:       outputMode,
+		KafkaBrokers:     kafkaBrokersList,
+		KafkaTopic:       *kafkaTopic,
 	}
 
 	if *enableValidation {

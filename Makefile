@@ -1,6 +1,10 @@
 .PHONY: build clean run run-node1 run-node2 run-node3 run-all run-agg-time run-agg-count run-agg-time-node1 run-agg-time-node2 run-agg-time-node3 run-agg-time-all test lint deps docker-etcd docker-stop \
 	build-arrow run-arrow run-arrow-client run-arrow-bench \
-	rust-build rust-clean rust-test build-with-rust build-all-with-rust
+	rust-build rust-clean rust-test build-with-rust build-all-with-rust \
+	docker-build docker-kafka docker-kafka-stop \
+	k8s-apply k8s-delete k8s-hpa k8s-status \
+	run-kafka-collector run-kafka-analyzer run-python-collector run-python-bench \
+	pip-install-all
 
 BINARY=collector
 BUILD_DIR=build
@@ -103,6 +107,9 @@ run-arrow-bench: ## Run Python Arrow Flight client with benchmark
 pip-install: ## Install Python dependencies for Arrow client
 	pip install -r python/requirements.txt
 
+pip-install-all: ## Install all Python dependencies (Arrow, Kafka, benchmark)
+	pip install -r python/requirements.txt
+
 # --- Testing & Linting ---
 
 test: ## Run tests
@@ -125,3 +132,68 @@ docker-etcd: ## Start etcd in Docker
 
 docker-stop: ## Stop etcd container
 	docker stop etcd && docker rm etcd
+
+docker-build: ## Build Docker image for collector and arrow-server
+	docker build -t energy-collector:latest .
+
+docker-kafka: ## Start Kafka and Zookeeper in Docker
+	docker run -d --name zookeeper \
+		-p 2181:2181 \
+		-e ALLOW_ANONYMOUS_LOGIN=yes \
+		bitnami/zookeeper:latest
+	docker run -d --name kafka \
+		-p 9092:9092 \
+		-e KAFKA_CFG_ZOOKEEPER_CONNECT=zookeeper:2181 \
+		-e ALLOW_PLAINTEXT_LISTENER=yes \
+		-e KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT \
+		-e KAFKA_CFG_LISTENERS=INTERNAL://0.0.0.0:9092,EXTERNAL://0.0.0.0:9093 \
+		-e KAFKA_CFG_ADVERTISED_LISTENERS=INTERNAL://localhost:9092,EXTERNAL://localhost:9093 \
+		-e KAFKA_CFG_INTER_BROKER_LISTENER_NAME=INTERNAL \
+		-e KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE=true \
+		bitnami/kafka:latest
+
+docker-kafka-stop: ## Stop Kafka and Zookeeper containers
+	docker stop kafka && docker rm kafka
+	docker stop zookeeper && docker rm zookeeper
+
+# --- Kubernetes ---
+
+k8s-apply: ## Apply all Kubernetes manifests
+	kubectl apply -f k8s/namespace.yaml
+	kubectl apply -f k8s/etcd-deployment.yaml
+	kubectl apply -f k8s/kafka-deployment.yaml
+	kubectl apply -f k8s/collector-deployment.yaml
+	kubectl apply -f k8s/arrow-server-deployment.yaml
+	kubectl apply -f k8s/hpa.yaml
+
+k8s-delete: ## Delete all Kubernetes resources
+	kubectl delete -f k8s/hpa.yaml --ignore-not-found
+	kubectl delete -f k8s/arrow-server-deployment.yaml --ignore-not-found
+	kubectl delete -f k8s/collector-deployment.yaml --ignore-not-found
+	kubectl delete -f k8s/kafka-deployment.yaml --ignore-not-found
+	kubectl delete -f k8s/etcd-deployment.yaml --ignore-not-found
+	kubectl delete namespace energy-system --ignore-not-found
+
+k8s-hpa: ## Check HPA status
+	kubectl -n energy-system get hpa -w
+
+k8s-status: ## Show status of all pods in energy-system
+	kubectl -n energy-system get all
+
+# --- Kafka collector (Go) ---
+
+run-kafka-collector: ## Run Go collector with Kafka output (requires etcd + Kafka)
+	go run ./cmd/collector -id=kafka-node1 -endpoints=localhost:2379 -meters=50 -shards=5 -interval=10s -kafka -kafka-brokers=localhost:9092 -kafka-topic=energy-readings
+
+# --- Kafka analyzer (Python) ---
+
+run-kafka-analyzer: ## Run Python Kafka analyzer with sliding window
+	python python/kafka_analyzer.py --broker=localhost:9092 --topic=energy-readings --window=300
+
+# --- Python collector ---
+
+run-python-collector: ## Run Python async collector (benchmark mode)
+	python python/async_collector.py --meters=50 --interval=5 --benchmark --benchmark-cycles=10
+
+run-python-bench: ## Run Go vs Python benchmark comparison
+	python python/benchmark_compare.py --meters=50 --cycles=10 --output=./benchmark_results

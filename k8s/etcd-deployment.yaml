@@ -1,0 +1,69 @@
+# k8s/etcd-deployment.yaml
+# Развёртывание etcd для координации сборщиков
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: etcd
+  namespace: energy-system
+  labels:
+    app: etcd
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: etcd
+  template:
+    metadata:
+      labels:
+        app: etcd
+    spec:
+      containers:
+        - name: etcd
+          image: bitnami/etcd:3.5
+          ports:
+            - containerPort: 2379
+              name: client
+            - containerPort: 2380
+              name: peer
+          env:
+            - name: ALLOW_NONE_AUTHENTICATION
+              value: "yes"
+            - name: ETCD_ADVERTISE_CLIENT_URLS
+              value: "http://etcd:2379"
+            - name: ETCD_LISTEN_CLIENT_URLS
+              value: "http://0.0.0.0:2379"
+            - name: ETCD_LISTEN_PEER_URLS
+              value: "http://0.0.0.0:2380"
+            - name: ETCD_INITIAL_ADVERTISE_PEER_URLS
+              value: "http://etcd:2380"
+            - name: ETCD_INITIAL_CLUSTER
+              value: "default=http://etcd:2380"
+            - name: ETCD_INITIAL_CLUSTER_TOKEN
+              value: "energy-cluster"
+            - name: ETCD_INITIAL_CLUSTER_STATE
+              value: "new"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: etcd
+  namespace: energy-system
+  labels:
+    app: etcd
+spec:
+  ports:
+    - port: 2379
+      name: client
+      targetPort: 2379
+    - port: 2380
+      name: peer
+      targetPort: 2380
+  selector:
+    app: etcd

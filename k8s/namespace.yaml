@@ -1,0 +1,6 @@
+# k8s/namespace.yaml
+# Namespace для конвейера энергопотребления
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: energy-system

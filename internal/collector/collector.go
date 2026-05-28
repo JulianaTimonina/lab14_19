@@ -12,7 +12,18 @@ import (
 
 	"github.com/yliana-efimova/energy-collector/internal/aggregator"
 	"github.com/yliana-efimova/energy-collector/internal/coordinator"
+	"github.com/yliana-efimova/energy-collector/internal/kafkautil"
 	"github.com/yliana-efimova/energy-collector/internal/source"
+)
+
+// OutputMode defines how collected readings are output.
+type OutputMode int
+
+const (
+	// OutputLog outputs readings to the log (default).
+	OutputLog OutputMode = iota
+	// OutputKafka outputs readings to a Kafka topic.
+	OutputKafka
 )
 
 // Config holds the collector configuration.
@@ -30,6 +41,13 @@ type Config struct {
 	// When enabled, each reading is validated against the Rust validator library.
 	// Invalid readings are logged as warnings but not discarded.
 	EnableValidation bool
+
+	// OutputMode selects how readings are output (log or Kafka).
+	OutputMode OutputMode
+
+	// Kafka config (used when OutputMode == OutputKafka).
+	KafkaBrokers []string
+	KafkaTopic   string
 }
 
 // Collector represents a data collector instance.
@@ -38,6 +56,7 @@ type Collector struct {
 	coord       *coordinator.Coordinator
 	source      *source.Source
 	agg         *aggregator.Aggregator
+	kafkaProd   *kafkautil.Producer
 	mu          sync.Mutex
 	collected   int
 }
@@ -58,6 +77,23 @@ func New(cfg Config) *Collector {
 			c.agg = agg
 			log.Printf("[%s] tumbling window aggregator enabled: type=%s, window_size=%v, max_records=%d",
 				cfg.CollectorID, agg.GetConfig().Type, agg.GetConfig().WindowSize, agg.GetConfig().MaxRecords)
+		}
+	}
+
+	// Initialize Kafka producer if output mode is Kafka
+	if cfg.OutputMode == OutputKafka {
+		if len(cfg.KafkaBrokers) == 0 {
+			log.Printf("[%s] WARNING: Kafka output mode selected but no brokers specified, falling back to log output", cfg.CollectorID)
+		} else {
+			topic := cfg.KafkaTopic
+			if topic == "" {
+				topic = "energy-readings"
+			}
+			c.kafkaProd = kafkautil.NewProducer(kafkautil.ProducerConfig{
+				Brokers: cfg.KafkaBrokers,
+				Topic:   topic,
+			})
+			log.Printf("[%s] Kafka producer enabled: brokers=%v, topic=%s", cfg.CollectorID, cfg.KafkaBrokers, topic)
 		}
 	}
 
@@ -233,8 +269,16 @@ func (c *Collector) collectOnce(ctx context.Context) {
 					c.cfg.CollectorID, len(aggregated), len(readings), c.collected)
 			}
 		}
+	} else if c.kafkaProd != nil {
+		// Kafka output mode: send readings to Kafka topic
+		if err := c.kafkaProd.SendReadings(ctx, readings); err != nil {
+			log.Printf("[%s] failed to send readings to Kafka: %v", c.cfg.CollectorID, err)
+		} else {
+			log.Printf("[%s] sent %d readings to Kafka topic %s (total: %d)",
+				c.cfg.CollectorID, len(readings), c.cfg.KafkaTopic, c.collected)
+		}
 	} else {
-		// Raw mode: output each reading as JSON
+		// Raw mode: output each reading as JSON to log
 		for _, r := range readings {
 			data, _ := json.Marshal(r)
 			log.Printf("[%s] DATA %s", c.cfg.CollectorID, string(data))
@@ -266,6 +310,14 @@ func (c *Collector) Stop() error {
 			}
 			log.Printf("[%s] final flush: %d aggregated records", c.cfg.CollectorID, len(aggregated))
 		}
+	}
+
+	// Close Kafka producer if used
+	if c.kafkaProd != nil {
+		if err := c.kafkaProd.Close(); err != nil {
+			log.Printf("[%s] error closing Kafka producer: %v", c.cfg.CollectorID, err)
+		}
+		log.Printf("[%s] Kafka producer closed", c.cfg.CollectorID)
 	}
 
 	if c.coord != nil {

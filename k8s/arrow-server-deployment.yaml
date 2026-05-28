@@ -1,0 +1,64 @@
+# k8s/arrow-server-deployment.yaml
+# Развёртывание Arrow Flight сервера
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: arrow-server
+  namespace: energy-system
+  labels:
+    app: arrow-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: arrow-server
+  template:
+    metadata:
+      labels:
+        app: arrow-server
+    spec:
+      containers:
+        - name: arrow-server
+          image: energy-collector:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - arrow-server
+          args:
+            - -port=50051
+            - -meters=50
+            - -interval=10s
+          ports:
+            - containerPort: 50051
+              name: arrow
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          livenessProbe:
+            tcpSocket:
+              port: 50051
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            tcpSocket:
+              port: 50051
+            initialDelaySeconds: 5
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: arrow-server
+  namespace: energy-system
+  labels:
+    app: arrow-server
+spec:
+  ports:
+    - port: 50051
+      name: arrow
+      targetPort: 50051
+  selector:
+    app: arrow-server
